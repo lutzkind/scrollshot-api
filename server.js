@@ -7,10 +7,19 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: true });
 const PORT = Number(process.env.PORT || 3199);
 const PLAYWRIGHT_CHANNEL = process.env.PLAYWRIGHT_CHANNEL || 'chrome';
 const CHROME_BIN = process.env.CHROME_BIN || '';
+const API_KEYS = new Set(
+  String(process.env.API_KEYS || process.env.API_KEY || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 30);
+const rateLimitBuckets = new Map();
 
 const IMAGE_MIME = {
   png: 'image/png',
@@ -44,6 +53,44 @@ function normalizeFormat(value) {
   const format = String(value || 'png').trim().toLowerCase();
   if (format === 'jpg') return 'jpeg';
   return format;
+}
+
+function readApiKey(request) {
+  const headerValue = request.headers['x-api-key'];
+  if (headerValue) return String(headerValue);
+
+  const authHeader = request.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice('Bearer '.length).trim();
+  }
+
+  const queryValue = request.query?.api_key;
+  if (queryValue) return String(queryValue);
+
+  return '';
+}
+
+function enforceRateLimit(request) {
+  const now = Date.now();
+  const ip = request.ip || 'unknown';
+  const bucket = rateLimitBuckets.get(ip);
+
+  if (!bucket || now >= bucket.resetAt) {
+    rateLimitBuckets.set(ip, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS,
+    });
+    return;
+  }
+
+  if (bucket.count >= RATE_LIMIT_MAX) {
+    const error = new Error('Rate limit exceeded');
+    error.statusCode = 429;
+    error.retryAfterSeconds = Math.ceil((bucket.resetAt - now) / 1000);
+    throw error;
+  }
+
+  bucket.count += 1;
 }
 
 function pickWaitUntil(value) {
@@ -322,6 +369,20 @@ async function capture(query) {
 
 app.get('/health', async () => ({ ok: true }));
 
+app.addHook('onRequest', async (request, reply) => {
+  if (request.url.startsWith('/health')) return;
+
+  if (API_KEYS.size > 0) {
+    const suppliedKey = readApiKey(request);
+    if (!API_KEYS.has(suppliedKey)) {
+      reply.code(401).send({ error: 'Unauthorized' });
+      return reply;
+    }
+  }
+
+  enforceRateLimit(request);
+});
+
 app.get('/take', async (request, reply) => {
   const result = await capture(request.query);
   try {
@@ -347,7 +408,10 @@ app.get('/download', async (request, reply) => app.inject({
 
 app.setErrorHandler((error, request, reply) => {
   request.log.error({ err: error }, 'capture failed');
-  reply.status(400).send({
+  if (error.statusCode === 429 && error.retryAfterSeconds) {
+    reply.header('retry-after', String(error.retryAfterSeconds));
+  }
+  reply.status(error.statusCode || 400).send({
     error: error.message,
   });
 });

@@ -13,6 +13,13 @@ A small self-hosted replacement for ScreenshotOne built for n8n workflows.
 - `GET /take`
 - `GET /health`
 
+## Access control
+
+- Set `API_KEY` or `API_KEYS` to require authentication on `/take` and `/download`
+- Send the key with `x-api-key: ...`, `Authorization: Bearer ...`, or `api_key=...`
+- Default rate limit is `30` requests per `60` seconds per client IP
+- Tune with `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_MS`
+
 ## Supported query params
 
 - `url` required
@@ -53,18 +60,19 @@ If your current node points at ScreenshotOne, switch the host to this service an
 Example still image:
 
 ```text
-http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=png&full_page=true&viewport_width=1280&viewport_height=2200
+http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=png&full_page=true&viewport_width=1280&viewport_height=2200&api_key=YOUR_KEY
 ```
 
 Example scrolling video for Cloudinary upload:
 
 ```text
-http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=mp4&full_page_scroll=true&viewport_width=1280&viewport_height=720&scroll_duration=9000
+http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=mp4&full_page_scroll=true&viewport_width=1280&viewport_height=720&scroll_duration=9000&api_key=YOUR_KEY
 ```
 
 In n8n:
 
 1. Use an `HTTP Request` node.
 2. Set `Response Format` to `File`.
-3. Pass the target URL in the query string.
-4. Send the returned binary directly to your Cloudinary upload node.
+3. Add your key as `x-api-key` or `api_key`.
+4. Pass the target URL in the query string.
+5. Send the returned binary directly to your Cloudinary upload node.
