@@ -34,6 +34,22 @@ const VIDEO_MIME = {
   gif: 'image/gif',
 };
 
+const SUPPORTED_EASINGS = new Set([
+  'linear',
+  'ease_in_quad',
+  'ease_out_quad',
+  'ease_in_out_quad',
+  'ease_in_cubic',
+  'ease_out_cubic',
+  'ease_in_out_cubic',
+  'ease_in_quart',
+  'ease_out_quart',
+  'ease_in_out_quart',
+  'ease_in_quint',
+  'ease_out_quint',
+  'ease_in_out_quint',
+]);
+
 function toBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
@@ -49,10 +65,62 @@ function toInt(value, fallback, { min, max } = {}) {
   return parsed;
 }
 
+function toFloat(value, fallback, { min, max } = {}) {
+  const parsed = Number.parseFloat(String(value ?? ''));
+  if (Number.isNaN(parsed)) return fallback;
+  if (min !== undefined && parsed < min) return min;
+  if (max !== undefined && parsed > max) return max;
+  return parsed;
+}
+
+function ensureEven(value) {
+  return value % 2 === 0 ? value : value + 1;
+}
+
 function normalizeFormat(value) {
   const format = String(value || 'png').trim().toLowerCase();
   if (format === 'jpg') return 'jpeg';
   return format;
+}
+
+function normalizeWaitUntil(value) {
+  const candidate = String(value || '').trim().toLowerCase();
+  if (candidate === 'networkidle0' || candidate === 'networkidle2') {
+    return 'networkidle';
+  }
+  if (['load', 'domcontentloaded', 'networkidle', 'commit'].includes(candidate)) {
+    return candidate;
+  }
+  return null;
+}
+
+function pickWaitUntilSequence(value) {
+  const rawValues = Array.isArray(value) ? value : [value];
+  const normalized = rawValues
+    .map((entry) => normalizeWaitUntil(entry))
+    .filter(Boolean);
+
+  if (normalized.length === 0) {
+    return ['networkidle'];
+  }
+
+  return [...new Set(normalized)];
+}
+
+function normalizePreset(value) {
+  const preset = String(value || 'medium').trim().toLowerCase();
+  if (['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'].includes(preset)) {
+    return preset;
+  }
+  return 'medium';
+}
+
+function normalizeEasing(value) {
+  const easing = String(value || 'ease_in_out_quint').trim().toLowerCase();
+  if (SUPPORTED_EASINGS.has(easing)) {
+    return easing;
+  }
+  return 'ease_in_out_quint';
 }
 
 function readApiKey(request) {
@@ -93,14 +161,6 @@ function enforceRateLimit(request) {
   bucket.count += 1;
 }
 
-function pickWaitUntil(value) {
-  const candidate = String(value || 'networkidle').trim().toLowerCase();
-  if (['load', 'domcontentloaded', 'networkidle', 'commit'].includes(candidate)) {
-    return candidate;
-  }
-  return 'networkidle';
-}
-
 function assertUrl(target) {
   if (!target) throw new Error('Missing required query parameter: url');
   const parsed = new URL(String(target));
@@ -111,29 +171,73 @@ function assertUrl(target) {
 }
 
 function buildOptions(query) {
-  const format = normalizeFormat(query.format);
+  const format = normalizeFormat(query.format || 'mp4');
   const videoRequested = ['webm', 'mp4', 'gif'].includes(format);
+  const scenario = String(query.scenario || '').trim().toLowerCase();
+  const waitUntilSequence = pickWaitUntilSequence(query.wait_until);
+  const viewportWidth = toInt(query.viewport_width ?? query.viewportWidth, 1280, { min: 320, max: 3840 });
+  const viewportHeight = toInt(query.viewport_height ?? query.viewportHeight, 720, { min: 320, max: 3840 });
+  const deviceScaleFactor = toFloat(
+    query.device_scale_factor ?? query.scale_factor,
+    videoRequested ? 1 : 1,
+    { min: 1, max: 3 },
+  );
+  const defaultOutputWidth = videoRequested
+    ? viewportWidth
+    : Math.round(viewportWidth * deviceScaleFactor);
+  const defaultOutputHeight = videoRequested
+    ? viewportHeight
+    : Math.round(viewportHeight * deviceScaleFactor);
+  const outputWidth = ensureEven(toInt(query.width, defaultOutputWidth, { min: 320, max: 4096 }));
+  const outputHeight = ensureEven(toInt(query.height, defaultOutputHeight, { min: 320, max: 4096 }));
+  const defaultTotalDurationMs = toInt(query.animation_duration, 9000, { min: 1000, max: 120000 });
+  const totalDurationMs = query.duration !== undefined
+    ? toInt(query.duration, 5, { min: 1, max: 120 }) * 1000
+    : defaultTotalDurationMs;
   const scrollingRequested = toBoolean(query.full_page_scroll, false)
     || toBoolean(query.animate, false)
     || toBoolean(query.scrolling_screenshot, false)
+    || scenario === 'scroll'
     || videoRequested;
 
   return {
     targetUrl: assertUrl(query.url),
     format,
-    width: toInt(query.viewport_width ?? query.width, 1280, { min: 320, max: 3840 }),
-    height: toInt(query.viewport_height ?? query.height, 720, { min: 320, max: 3840 }),
-    deviceScaleFactor: Number.parseFloat(String(query.device_scale_factor ?? query.scale_factor ?? 1)) || 1,
+    viewportWidth,
+    viewportHeight,
+    outputWidth,
+    outputHeight,
+    deviceScaleFactor,
     fullPage: toBoolean(query.full_page, true),
     preloadLazyContent: toBoolean(query.preload_lazy_content, true),
-    waitUntil: pickWaitUntil(query.wait_until),
+    waitUntil: waitUntilSequence[0],
+    waitUntilSequence,
     navigationTimeoutMs: toInt(query.navigation_timeout, 45000, { min: 5000, max: 180000 }),
-    delayMs: toInt(query.delay, 1500, { min: 0, max: 120000 }),
-    imageQuality: toInt(query.image_quality ?? query.quality, 90, { min: 1, max: 100 }),
+    delayMs: toInt(query.delay, 0, { min: 0, max: 120000 }),
+    imageQuality: toInt(query.image_quality ?? query.quality, 92, { min: 1, max: 100 }),
     scrollingRequested,
-    scrollDurationMs: toInt(query.scroll_duration ?? query.animation_duration, 9000, { min: 1000, max: 120000 }),
-    holdDurationMs: toInt(query.hold_duration, 1200, { min: 0, max: 30000 }),
-    scrollBack: toBoolean(query.scroll_back, false),
+    totalDurationMs,
+    scrollDelayMs: toInt(query.scroll_delay, 500, { min: 0, max: 15000 }),
+    scrollStepDurationMs: toInt(query.scroll_duration, 1500, { min: 120, max: 30000 }),
+    scrollByPx: toInt(query.scroll_by, Math.max(Math.round(viewportHeight * 0.92), 640), { min: 100, max: 3000 }),
+    scrollStartDelayMs: toInt(query.scroll_start_delay, 0, { min: 0, max: 30000 }),
+    scrollStartImmediately: toBoolean(query.scroll_start_immediately, true),
+    scrollBack: toBoolean(query.scroll_back, scenario === 'scroll'),
+    scrollComplete: toBoolean(query.scroll_complete, true),
+    scrollBackAfterDurationMs: query.scroll_back_after_duration === undefined
+      ? null
+      : toInt(query.scroll_back_after_duration, 0, { min: 0, max: 120000 }),
+    scrollStopAfterDurationMs: query.scroll_stop_after_duration === undefined
+      ? null
+      : toInt(query.scroll_stop_after_duration, totalDurationMs, { min: 0, max: 120000 }),
+    scrollEasing: normalizeEasing(query.scroll_easing),
+    scrollJitterPx: toInt(query.scroll_jitter_px, 42, { min: 0, max: 240 }),
+    holdDurationMs: toInt(query.hold_duration, 0, { min: 0, max: 30000 }),
+    ignoreHostErrors: toBoolean(query.ignore_host_errors, false),
+    videoFps: toInt(query.video_fps ?? query.fps, 30, { min: 12, max: 60 }),
+    videoCrf: query.video_crf ?? query.crf,
+    videoBitrateKbps: toInt(query.video_bitrate_kbps ?? query.bitrate_kbps, 4000, { min: 800, max: 20000 }),
+    videoPreset: normalizePreset(query.video_preset ?? query.preset),
     outputName: String(query.file_name || randomUUID()).replace(/[^a-zA-Z0-9._-]/g, '_'),
   };
 }
@@ -163,6 +267,16 @@ async function bestEffortNetworkIdle(page) {
     await page.waitForLoadState('networkidle', { timeout: 5000 });
   } catch {
     // Some pages never reach network idle; ignore.
+  }
+}
+
+async function waitForRequestedStates(page, options) {
+  for (const state of options.waitUntilSequence.slice(1)) {
+    try {
+      await page.waitForLoadState(state, { timeout: 8000 });
+    } catch {
+      // Best effort only. Some pages never settle into later states.
+    }
   }
 }
 
@@ -203,50 +317,164 @@ async function renderScreenshot(page, options) {
 }
 
 async function recordScrollingVideo(page, options) {
-  await page.evaluate(async ({ durationMs, scrollBack }) => {
+  const evaluationResult = await page.evaluate(async ({
+    totalDurationMs,
+    scrollDelayMs,
+    scrollStepDurationMs,
+    scrollByPx,
+    scrollBack,
+    scrollComplete,
+    scrollStartDelayMs,
+    scrollStartImmediately,
+    scrollBackAfterDurationMs,
+    scrollStopAfterDurationMs,
+    scrollEasing,
+    scrollJitterPx,
+  }) => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const rand = (min, max) => min + Math.random() * (max - min);
+    const randInt = (min, max) => Math.round(rand(min, max));
+    const easingMap = {
+      linear: (t) => t,
+      ease_in_quad: (t) => t * t,
+      ease_out_quad: (t) => 1 - (1 - t) * (1 - t),
+      ease_in_out_quad: (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2),
+      ease_in_cubic: (t) => t ** 3,
+      ease_out_cubic: (t) => 1 - (1 - t) ** 3,
+      ease_in_out_cubic: (t) => (t < 0.5 ? 4 * t ** 3 : 1 - ((-2 * t + 2) ** 3) / 2),
+      ease_in_quart: (t) => t ** 4,
+      ease_out_quart: (t) => 1 - (1 - t) ** 4,
+      ease_in_out_quart: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - ((-2 * t + 2) ** 4) / 2),
+      ease_in_quint: (t) => t ** 5,
+      ease_out_quint: (t) => 1 - (1 - t) ** 5,
+      ease_in_out_quint: (t) => (t < 0.5 ? 16 * t ** 5 : 1 - ((-2 * t + 2) ** 5) / 2),
+    };
+    const easing = easingMap[scrollEasing] || easingMap.ease_in_out_quint;
     const maxScroll = Math.max(
       document.body.scrollHeight,
       document.documentElement.scrollHeight,
     ) - window.innerHeight;
 
-    if (maxScroll <= 0) {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(durationMs, 1000)));
-      return { maxScroll: 0 };
-    }
+    const animateTo = async (destination, durationMs) => new Promise((resolve) => {
+      const startY = window.scrollY;
+      const delta = destination - startY;
+      const startTime = performance.now();
 
-    const easeInOut = (t) => (t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t);
-
-    await new Promise((resolve) => {
-      const start = performance.now();
       const tick = (now) => {
-        const progress = Math.min((now - start) / durationMs, 1);
-        const target = maxScroll * easeInOut(progress);
-        window.scrollTo(0, target);
+        const progress = Math.min((now - startTime) / durationMs, 1);
+        const eased = easing(progress);
+        window.scrollTo(0, startY + delta * eased);
         if (progress < 1) {
           requestAnimationFrame(tick);
         } else {
           resolve();
         }
       };
+
       requestAnimationFrame(tick);
     });
 
-    if (scrollBack) {
-      window.scrollTo(0, 0);
+    const startedAt = performance.now();
+    const stopAt = startedAt + (scrollStopAfterDurationMs ?? totalDurationMs);
+    let scrolledBack = false;
+
+    if (!scrollStartImmediately && scrollStartDelayMs > 0) {
+      await sleep(scrollStartDelayMs);
     }
 
-    return { maxScroll };
+    if (maxScroll <= 0) {
+      const remaining = Math.max(0, stopAt - performance.now());
+      if (remaining > 0) {
+        await sleep(remaining);
+      }
+      return { maxScroll: 0, reachedBottom: true };
+    }
+
+    while (performance.now() < stopAt) {
+      const elapsed = performance.now() - startedAt;
+      const remaining = stopAt - performance.now();
+      const currentY = window.scrollY;
+      const atBottom = currentY >= maxScroll - 4;
+
+      if (!scrolledBack && scrollBack && scrollBackAfterDurationMs !== null && elapsed >= scrollBackAfterDurationMs) {
+        await animateTo(0, Math.max(700, Math.round(scrollStepDurationMs * 0.85)));
+        scrolledBack = true;
+        continue;
+      }
+
+      if (atBottom) {
+        if (scrollComplete) {
+          break;
+        }
+
+        if (!scrolledBack && scrollBack && scrollBackAfterDurationMs === null && elapsed >= totalDurationMs * 0.72) {
+          await animateTo(0, Math.max(850, Math.round(scrollStepDurationMs * 0.95)));
+          scrolledBack = true;
+          continue;
+        }
+
+        await sleep(Math.min(remaining, 220));
+        continue;
+      }
+
+      const plannedStep = scrollByPx + randInt(-scrollJitterPx, scrollJitterPx);
+      const correctionAllowance = Math.min(currentY, randInt(10, Math.max(18, Math.round(scrollJitterPx * 0.9))));
+      const nextY = Math.max(
+        0,
+        Math.min(maxScroll, currentY + plannedStep),
+      );
+      const stepDurationMs = Math.min(
+        Math.max(220, scrollStepDurationMs + randInt(-220, 260)),
+        Math.max(220, remaining - Math.min(scrollDelayMs, 180)),
+      );
+
+      await animateTo(nextY, stepDurationMs);
+
+      if (Math.random() < 0.38 && correctionAllowance > 14 && performance.now() + 180 < stopAt) {
+        const rewindTo = Math.max(0, window.scrollY - correctionAllowance);
+        window.scrollTo(0, rewindTo);
+        await sleep(randInt(80, 180));
+        window.scrollTo(0, Math.min(maxScroll, rewindTo + correctionAllowance + randInt(8, 24)));
+      }
+
+      if (performance.now() >= stopAt) {
+        break;
+      }
+
+      const pauseMs = Math.min(
+        Math.max(0, scrollDelayMs + randInt(-120, 160)),
+        Math.max(0, stopAt - performance.now()),
+      );
+      if (pauseMs > 0) {
+        await sleep(pauseMs);
+      }
+    }
+
+    return {
+      maxScroll,
+      reachedBottom: window.scrollY >= maxScroll - 4,
+    };
   }, {
-    durationMs: options.scrollDurationMs,
+    totalDurationMs: options.totalDurationMs,
+    scrollDelayMs: options.scrollDelayMs,
+    scrollStepDurationMs: options.scrollStepDurationMs,
+    scrollByPx: options.scrollByPx,
     scrollBack: options.scrollBack,
+    scrollComplete: options.scrollComplete,
+    scrollStartDelayMs: options.scrollStartDelayMs,
+    scrollStartImmediately: options.scrollStartImmediately,
+    scrollBackAfterDurationMs: options.scrollBackAfterDurationMs,
+    scrollStopAfterDurationMs: options.scrollStopAfterDurationMs,
+    scrollEasing: options.scrollEasing,
+    scrollJitterPx: options.scrollJitterPx,
   });
 
-  if (options.holdDurationMs > 0) {
+  if (options.holdDurationMs > 0 && evaluationResult.reachedBottom) {
     await page.waitForTimeout(options.holdDurationMs);
   }
 }
 
-async function transcode(inputPath, targetFormat, tmpDir) {
+async function transcode(inputPath, targetFormat, tmpDir, options) {
   if (!ffmpegPath) {
     throw new Error('ffmpeg-static is not available for transcoding');
   }
@@ -255,16 +483,34 @@ async function transcode(inputPath, targetFormat, tmpDir) {
   const args = ['-y', '-i', inputPath];
 
   if (targetFormat === 'mp4') {
+    const crfMode = options.videoCrf !== undefined && options.videoCrf !== null && String(options.videoCrf) !== '';
+    const videoCrf = crfMode
+      ? toInt(options.videoCrf, 18, { min: 12, max: 35 })
+      : null;
     args.push(
       '-an',
+      '-c:v', 'libx264',
+      '-preset', options.videoPreset,
+      '-profile:v', 'high',
       '-movflags', 'faststart',
       '-pix_fmt', 'yuv420p',
-      '-vf', 'fps=30',
-      outputPath,
+      '-vf', `fps=${options.videoFps},scale=${options.outputWidth}:${options.outputHeight}:flags=lanczos`,
     );
+
+    if (crfMode) {
+      args.push('-crf', String(videoCrf));
+    } else {
+      args.push(
+        '-b:v', `${options.videoBitrateKbps}k`,
+        '-maxrate', `${Math.round(options.videoBitrateKbps * 1.2)}k`,
+        '-bufsize', `${options.videoBitrateKbps * 2}k`,
+      );
+    }
+
+    args.push(outputPath);
   } else if (targetFormat === 'gif') {
     args.push(
-      '-vf', 'fps=12,scale=1280:-1:flags=lanczos',
+      '-vf', `fps=${Math.min(options.videoFps, 15)},scale=${options.outputWidth}:${options.outputHeight}:flags=lanczos`,
       outputPath,
     );
   } else {
@@ -299,11 +545,12 @@ async function capture(query) {
 
   try {
     const contextOptions = {
-      viewport: { width: options.width, height: options.height },
+      viewport: { width: options.viewportWidth, height: options.viewportHeight },
       deviceScaleFactor: options.deviceScaleFactor,
+      ignoreHTTPSErrors: options.ignoreHostErrors,
       recordVideo: options.scrollingRequested ? {
         dir: tmpDir,
-        size: { width: options.width, height: options.height },
+        size: { width: options.outputWidth, height: options.outputHeight },
       } : undefined,
     };
 
@@ -312,9 +559,12 @@ async function capture(query) {
     page.setDefaultNavigationTimeout(options.navigationTimeoutMs);
 
     await page.goto(options.targetUrl, { waitUntil: options.waitUntil, timeout: options.navigationTimeoutMs });
+    await waitForRequestedStates(page, options);
+
     if (options.delayMs > 0) {
       await page.waitForTimeout(options.delayMs);
     }
+
     await bestEffortNetworkIdle(page);
 
     if (options.preloadLazyContent && !options.scrollingRequested) {
@@ -345,7 +595,7 @@ async function capture(query) {
     let mimeType = VIDEO_MIME.webm;
 
     if (options.format === 'mp4' || options.format === 'gif') {
-      outputPath = await transcode(recordedPath, options.format, tmpDir);
+      outputPath = await transcode(recordedPath, options.format, tmpDir, options);
       extension = options.format;
       mimeType = VIDEO_MIME[options.format];
     }
