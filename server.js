@@ -108,11 +108,11 @@ function pickWaitUntilSequence(value) {
 }
 
 function normalizePreset(value) {
-  const preset = String(value || 'medium').trim().toLowerCase();
+  const preset = String(value || 'fast').trim().toLowerCase();
   if (['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'].includes(preset)) {
     return preset;
   }
-  return 'medium';
+  return 'fast';
 }
 
 function normalizeEasing(value) {
@@ -271,9 +271,10 @@ async function bestEffortNetworkIdle(page) {
 }
 
 async function waitForRequestedStates(page, options) {
+  const timeout = options.scrollingRequested ? 2500 : 8000;
   for (const state of options.waitUntilSequence.slice(1)) {
     try {
-      await page.waitForLoadState(state, { timeout: 8000 });
+      await page.waitForLoadState(state, { timeout });
     } catch {
       // Best effort only. Some pages never settle into later states.
     }
@@ -300,7 +301,9 @@ async function preloadLazyContent(page) {
     lastScrollY = metrics.scrollY;
     await page.evaluate((nextY) => window.scrollTo({ top: nextY, behavior: 'auto' }), metrics.scrollY + viewportHeight);
     await page.waitForTimeout(250);
-    await bestEffortNetworkIdle(page);
+    if (!options.scrollingRequested) {
+      await bestEffortNetworkIdle(page);
+    }
   }
 
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
@@ -480,7 +483,17 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
   }
 
   const outputPath = path.join(tmpDir, `output.${targetFormat}`);
-  const args = ['-y', '-i', inputPath];
+  const args = ['-y'];
+
+  if (options.trimStartSeconds && options.trimStartSeconds > 0) {
+    args.push('-ss', String(options.trimStartSeconds));
+  }
+
+  args.push('-i', inputPath);
+
+  if (options.trimDurationSeconds && options.trimDurationSeconds > 0) {
+    args.push('-t', String(options.trimDurationSeconds));
+  }
 
   if (targetFormat === 'mp4') {
     const crfMode = options.videoCrf !== undefined && options.videoCrf !== null && String(options.videoCrf) !== '';
@@ -538,6 +551,33 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
   return outputPath;
 }
 
+async function probeDurationSeconds(inputPath) {
+  if (!ffmpegPath) {
+    return null;
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, ['-i', inputPath], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', reject);
+    child.on('close', () => {
+      const match = stderr.match(/Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!match) {
+        resolve(null);
+        return;
+      }
+
+      const [, hh, mm, ss] = match;
+      resolve((Number(hh) * 3600) + (Number(mm) * 60) + Number(ss));
+    });
+  });
+}
+
 async function capture(query) {
   const options = buildOptions(query);
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'scrollshot-'));
@@ -590,12 +630,21 @@ async function capture(query) {
     await context.close();
 
     const recordedPath = await video.path();
+    const recordedDurationSeconds = await probeDurationSeconds(recordedPath);
     let outputPath = recordedPath;
     let extension = 'webm';
     let mimeType = VIDEO_MIME.webm;
 
     if (options.format === 'mp4' || options.format === 'gif') {
-      outputPath = await transcode(recordedPath, options.format, tmpDir, options);
+      const desiredDurationSeconds = options.totalDurationMs / 1000;
+      const trimStartSeconds = recordedDurationSeconds && recordedDurationSeconds > desiredDurationSeconds
+        ? Math.max(0, recordedDurationSeconds - desiredDurationSeconds)
+        : 0;
+      outputPath = await transcode(recordedPath, options.format, tmpDir, {
+        ...options,
+        trimStartSeconds,
+        trimDurationSeconds: desiredDurationSeconds,
+      });
       extension = options.format;
       mimeType = VIDEO_MIME[options.format];
     }

@@ -47,7 +47,7 @@ A small self-hosted replacement for ScreenshotOne built for n8n workflows.
 - `hold_duration`
 - `preload_lazy_content=true|false`
 - `video_bitrate_kbps` default `4000`
-- `video_preset` default `medium`
+- `video_preset` default `fast`
 - `video_crf` optional if you want CRF mode instead of target bitrate
 - `ignore_host_errors=true|false`
 
