@@ -2,7 +2,7 @@ import Fastify from 'fastify';
 import ffmpegPath from 'ffmpeg-static';
 import { chromium } from 'playwright';
 import { randomUUID } from 'node:crypto';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -318,211 +318,175 @@ async function renderScreenshot(page, options) {
   });
 }
 
-async function recordScrollingVideo(page, options) {
-  const evaluationResult = await page.evaluate(async ({
-    totalDurationMs,
-    scrollDelayMs,
-    scrollStepDurationMs,
-    scrollByPx,
-    scrollSteps,
-    scrollBack,
-    scrollComplete,
-    scrollStartDelayMs,
-    scrollStartImmediately,
-    scrollBackAfterDurationMs,
-    scrollStopAfterDurationMs,
-    scrollEasing,
-    scrollJitterPx,
-  }) => {
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const rand = (min, max) => min + Math.random() * (max - min);
-    const randInt = (min, max) => Math.round(rand(min, max));
-    const easingMap = {
-      linear: (t) => t,
-      ease_in_quad: (t) => t * t,
-      ease_out_quad: (t) => 1 - (1 - t) * (1 - t),
-      ease_in_out_quad: (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2),
-      ease_in_cubic: (t) => t ** 3,
-      ease_out_cubic: (t) => 1 - (1 - t) ** 3,
-      ease_in_out_cubic: (t) => (t < 0.5 ? 4 * t ** 3 : 1 - ((-2 * t + 2) ** 3) / 2),
-      ease_in_quart: (t) => t ** 4,
-      ease_out_quart: (t) => 1 - (1 - t) ** 4,
-      ease_in_out_quart: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - ((-2 * t + 2) ** 4) / 2),
-      ease_in_quint: (t) => t ** 5,
-      ease_out_quint: (t) => 1 - (1 - t) ** 5,
-      ease_in_out_quint: (t) => (t < 0.5 ? 16 * t ** 5 : 1 - ((-2 * t + 2) ** 5) / 2),
-    };
-    const easing = easingMap[scrollEasing] || easingMap.ease_in_out_quint;
-    const maxScroll = Math.max(
-      document.body.scrollHeight,
-      document.documentElement.scrollHeight,
-    ) - window.innerHeight;
-
-    const buildFractions = (count, targetCoverage) => {
-      const fractions = [];
-      const midpoint = (count - 1) / 2;
-
-      for (let index = 0; index < count; index += 1) {
-        const progress = (index + 1) / count;
-        const shaped = progress ** 0.92;
-        const symmetry = midpoint === 0 ? 0 : (index - midpoint) / midpoint;
-        const offset = symmetry * 0.012;
-        fractions.push(Math.min(targetCoverage, Math.max(0.08, shaped * targetCoverage + offset)));
-      }
-
-      return fractions;
-    };
-
-    const buildDurations = (count, budgetMs, pauseMs) => {
-      const weights = [1.05, 1.02, 0.98, 0.95, 0.92, 0.9, 0.88, 0.86];
-      const chosen = Array.from({ length: count }, (_, index) => weights[index] ?? 0.84);
-      const totalWeight = chosen.reduce((sum, entry) => sum + entry, 0);
-      const basePauses = count > 1
-        ? [0.9, 1.25, 0.78, 1.08, 0.88, 1.12, 0.82].slice(0, count - 1)
-        : [];
-      const pauseWeight = basePauses.reduce((sum, entry) => sum + entry, 0) || 1;
-
-      return {
-        scrolls: chosen.map((weight) => Math.round((budgetMs * weight) / totalWeight)),
-        pauses: basePauses.map((weight) => Math.round((pauseMs * weight) / pauseWeight)),
-      };
-    };
-
-    const animateTo = async (destination, durationMs) => new Promise((resolve) => {
-      const startY = window.scrollY;
-      const delta = destination - startY;
-      const startTime = performance.now();
-
-      const tick = (now) => {
-        const progress = Math.min((now - startTime) / durationMs, 1);
-        const eased = easing(progress);
-        window.scrollTo(0, startY + delta * eased);
-        if (progress < 1) {
-          requestAnimationFrame(tick);
-        } else {
-          resolve();
-        }
-      };
-
-      requestAnimationFrame(tick);
-    });
-
-    const startedAt = performance.now();
-    const stopAt = startedAt + (scrollStopAfterDurationMs ?? totalDurationMs);
-    let scrolledBack = false;
-
-    if (!scrollStartImmediately && scrollStartDelayMs > 0) {
-      await sleep(scrollStartDelayMs);
-    }
-
-    if (maxScroll <= 0) {
-      const remaining = Math.max(0, stopAt - performance.now());
-      if (remaining > 0) {
-        await sleep(remaining);
-      }
-      return { maxScroll: 0, reachedBottom: true };
-    }
-
-    const stepCount = Math.max(1, scrollSteps || 4);
-    const targetCoverage = scrollComplete ? 1 : Math.min(0.92, Math.max(0.74, (scrollByPx * stepCount) / Math.max(maxScroll, 1)));
-    const fractions = buildFractions(stepCount, targetCoverage);
-    const remainingBudgetMs = Math.max(0, stopAt - performance.now());
-    const reserveTailMs = Math.min(650, Math.round(remainingBudgetMs * 0.08));
-    const pauseBudgetMs = stepCount > 1
-      ? Math.min(
-          Math.max(0, remainingBudgetMs * 0.16),
-          Math.max(240, scrollDelayMs) * (stepCount - 1),
-        )
-      : 0;
-    const rawScrollBudgetMs = Math.max(
-      stepCount * 320,
-      remainingBudgetMs - reserveTailMs - pauseBudgetMs,
-    );
-    const budgets = buildDurations(stepCount, rawScrollBudgetMs, pauseBudgetMs);
-
-    for (let index = 0; index < stepCount && performance.now() < stopAt; index += 1) {
-      const elapsed = performance.now() - startedAt;
-
-      if (!scrolledBack && scrollBack && scrollBackAfterDurationMs !== null && elapsed >= scrollBackAfterDurationMs) {
-        await animateTo(0, Math.max(650, Math.round(scrollStepDurationMs * 0.75)));
-        scrolledBack = true;
-      }
-
-      const currentY = window.scrollY;
-      const plannedTarget = Math.round(maxScroll * fractions[index]);
-      const minimumProgress = Math.round(currentY + Math.max(60, scrollByPx * 0.18));
-      const nextY = Math.max(currentY, Math.min(maxScroll, Math.max(plannedTarget, minimumProgress)));
-
-      if (nextY > currentY + 1) {
-        const remaining = stopAt - performance.now();
-        const durationMs = Math.max(
-          300,
-          Math.min(budgets.scrolls[index] ?? scrollStepDurationMs, remaining - 120),
-        );
-        await animateTo(nextY, durationMs);
-      }
-
-      if (index < stepCount - 1) {
-        const remaining = stopAt - performance.now();
-        const pauseMs = Math.max(0, Math.min(budgets.pauses[index] ?? scrollDelayMs, remaining - 60));
-        if (pauseMs > 0) {
-          await sleep(pauseMs);
-        }
-      }
-    }
-
-    if (!scrolledBack && scrollBack && scrollBackAfterDurationMs === null && scrollComplete && performance.now() < stopAt) {
-      await animateTo(0, Math.max(650, Math.round(scrollStepDurationMs * 0.72)));
-      scrolledBack = true;
-    }
-
-    const settleMs = Math.max(0, stopAt - performance.now());
-    if (settleMs > 0) {
-      await sleep(settleMs);
-    }
-
-    return {
-      maxScroll,
-      reachedBottom: window.scrollY >= maxScroll - 4,
-    };
-  }, {
-    totalDurationMs: options.totalDurationMs,
-    scrollDelayMs: options.scrollDelayMs,
-    scrollStepDurationMs: options.scrollStepDurationMs,
-    scrollByPx: options.scrollByPx,
-    scrollSteps: options.scrollSteps,
-    scrollBack: options.scrollBack,
-    scrollComplete: options.scrollComplete,
-    scrollStartDelayMs: options.scrollStartDelayMs,
-    scrollStartImmediately: options.scrollStartImmediately,
-    scrollBackAfterDurationMs: options.scrollBackAfterDurationMs,
-    scrollStopAfterDurationMs: options.scrollStopAfterDurationMs,
-    scrollEasing: options.scrollEasing,
-    scrollJitterPx: options.scrollJitterPx,
-  });
-
-  if (options.holdDurationMs > 0 && evaluationResult.reachedBottom) {
-    await page.waitForTimeout(options.holdDurationMs);
-  }
+function getEasingFunction(name) {
+  const easingMap = {
+    linear: (t) => t,
+    ease_in_quad: (t) => t * t,
+    ease_out_quad: (t) => 1 - (1 - t) * (1 - t),
+    ease_in_out_quad: (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2),
+    ease_in_cubic: (t) => t ** 3,
+    ease_out_cubic: (t) => 1 - (1 - t) ** 3,
+    ease_in_out_cubic: (t) => (t < 0.5 ? 4 * t ** 3 : 1 - ((-2 * t + 2) ** 3) / 2),
+    ease_in_quart: (t) => t ** 4,
+    ease_out_quart: (t) => 1 - (1 - t) ** 4,
+    ease_in_out_quart: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - ((-2 * t + 2) ** 4) / 2),
+    ease_in_quint: (t) => t ** 5,
+    ease_out_quint: (t) => 1 - (1 - t) ** 5,
+    ease_in_out_quint: (t) => (t < 0.5 ? 16 * t ** 5 : 1 - ((-2 * t + 2) ** 5) / 2),
+  };
+  return easingMap[name] || easingMap.ease_in_out_quint;
 }
 
-async function transcode(inputPath, targetFormat, tmpDir, options) {
+function buildFractions(count, targetCoverage) {
+  const fractions = [];
+  const midpoint = (count - 1) / 2;
+
+  for (let index = 0; index < count; index += 1) {
+    const progress = (index + 1) / count;
+    const shaped = progress ** 0.92;
+    const symmetry = midpoint === 0 ? 0 : (index - midpoint) / midpoint;
+    const offset = symmetry * 0.012;
+    fractions.push(Math.min(targetCoverage, Math.max(0.08, shaped * targetCoverage + offset)));
+  }
+
+  return fractions;
+}
+
+function buildDurations(count, budgetMs, pauseMs) {
+  const weights = [1.05, 1.02, 0.98, 0.95, 0.92, 0.9, 0.88, 0.86];
+  const chosen = Array.from({ length: count }, (_, index) => weights[index] ?? 0.84);
+  const totalWeight = chosen.reduce((sum, entry) => sum + entry, 0);
+  const basePauses = count > 1
+    ? [0.9, 1.25, 0.78, 1.08, 0.88, 1.12, 0.82].slice(0, count - 1)
+    : [];
+  const pauseWeight = basePauses.reduce((sum, entry) => sum + entry, 0) || 1;
+
+  return {
+    scrolls: chosen.map((weight) => Math.round((budgetMs * weight) / totalWeight)),
+    pauses: basePauses.map((weight) => Math.round((pauseMs * weight) / pauseWeight)),
+  };
+}
+
+async function getScrollMetrics(page) {
+  return page.evaluate(() => ({
+    maxScroll: Math.max(
+      document.body.scrollHeight,
+      document.documentElement.scrollHeight,
+    ) - window.innerHeight,
+  }));
+}
+
+function buildScrollTimeline(maxScroll, options) {
+  const totalDurationMs = options.totalDurationMs;
+  const stepCount = Math.max(1, options.scrollSteps || 4);
+  const startDelayMs = options.scrollStartImmediately ? 0 : options.scrollStartDelayMs;
+  const scrollBackEnabled = options.scrollBack && options.scrollComplete;
+  const scrollBackDurationMs = scrollBackEnabled
+    ? Math.max(650, Math.round(options.scrollStepDurationMs * 0.72))
+    : 0;
+  const tailHoldMs = Math.min(options.holdDurationMs, Math.max(0, totalDurationMs - startDelayMs));
+  const activeBudgetMs = Math.max(0, totalDurationMs - startDelayMs - tailHoldMs - scrollBackDurationMs);
+
+  const targetCoverage = maxScroll <= 0
+    ? 0
+    : options.scrollComplete
+      ? 1
+      : Math.min(0.92, Math.max(0.74, (options.scrollByPx * stepCount) / Math.max(maxScroll, 1)));
+  const fractions = buildFractions(stepCount, targetCoverage);
+  const pauseBudgetMs = stepCount > 1
+    ? Math.min(
+        Math.max(0, activeBudgetMs * 0.16),
+        Math.max(240, options.scrollDelayMs) * (stepCount - 1),
+      )
+    : 0;
+  const scrollBudgetMs = Math.max(
+    stepCount * 320,
+    activeBudgetMs - pauseBudgetMs,
+  );
+  const budgets = buildDurations(stepCount, scrollBudgetMs, pauseBudgetMs);
+
+  let currentMs = 0;
+  let currentY = 0;
+  const segments = [];
+
+  if (startDelayMs > 0) {
+    segments.push({ type: 'hold', startMs: currentMs, endMs: currentMs + startDelayMs, y: currentY });
+    currentMs += startDelayMs;
+  }
+
+  for (let index = 0; index < stepCount; index += 1) {
+    const plannedTarget = Math.round(maxScroll * fractions[index]);
+    const minimumProgress = Math.round(currentY + Math.max(60, options.scrollByPx * 0.18));
+    const nextY = Math.max(currentY, Math.min(maxScroll, Math.max(plannedTarget, minimumProgress)));
+    const durationMs = Math.max(300, budgets.scrolls[index] ?? options.scrollStepDurationMs);
+
+    if (nextY > currentY + 1 && currentMs < totalDurationMs) {
+      const endMs = Math.min(totalDurationMs, currentMs + durationMs);
+      segments.push({
+        type: 'scroll',
+        startMs: currentMs,
+        endMs,
+        startY: currentY,
+        endY: nextY,
+      });
+      currentMs = endMs;
+      currentY = nextY;
+    }
+
+    if (index < stepCount - 1 && currentMs < totalDurationMs) {
+      const pauseMs = Math.max(0, budgets.pauses[index] ?? options.scrollDelayMs);
+      if (pauseMs > 0) {
+        const endMs = Math.min(totalDurationMs, currentMs + pauseMs);
+        segments.push({ type: 'hold', startMs: currentMs, endMs, y: currentY });
+        currentMs = endMs;
+      }
+    }
+  }
+
+  if (scrollBackEnabled && currentMs < totalDurationMs) {
+    const endMs = Math.min(totalDurationMs, currentMs + scrollBackDurationMs);
+    segments.push({
+      type: 'scroll',
+      startMs: currentMs,
+      endMs,
+      startY: currentY,
+      endY: 0,
+    });
+    currentMs = endMs;
+    currentY = 0;
+  }
+
+  if (currentMs < totalDurationMs) {
+    segments.push({ type: 'hold', startMs: currentMs, endMs: totalDurationMs, y: currentY });
+  }
+
+  return segments;
+}
+
+function positionForTimestamp(segments, timeMs, easingFn) {
+  const segment = segments.find((entry) => timeMs <= entry.endMs) || segments.at(-1);
+  if (!segment) return 0;
+
+  if (segment.type === 'hold' || segment.endMs <= segment.startMs) {
+    return segment.y ?? segment.endY ?? 0;
+  }
+
+  const progress = Math.min(1, Math.max(0, (timeMs - segment.startMs) / (segment.endMs - segment.startMs)));
+  const eased = easingFn(progress);
+  return segment.startY + ((segment.endY - segment.startY) * eased);
+}
+
+async function encodeFrames(inputPattern, targetFormat, tmpDir, options) {
   if (!ffmpegPath) {
     throw new Error('ffmpeg-static is not available for transcoding');
   }
 
   const outputPath = path.join(tmpDir, `output.${targetFormat}`);
-  const args = ['-y'];
-
-  if (options.trimStartSeconds && options.trimStartSeconds > 0) {
-    args.push('-ss', String(options.trimStartSeconds));
-  }
-
-  args.push('-i', inputPath);
-
-  if (options.trimDurationSeconds && options.trimDurationSeconds > 0) {
-    args.push('-t', String(options.trimDurationSeconds));
-  }
+  const args = [
+    '-y',
+    '-framerate', String(options.videoFps),
+    '-i', inputPattern,
+  ];
 
   if (targetFormat === 'mp4') {
     const crfMode = options.videoCrf !== undefined && options.videoCrf !== null && String(options.videoCrf) !== '';
@@ -533,6 +497,7 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
       '-an',
       '-c:v', 'libx264',
       '-preset', options.videoPreset,
+      '-tune', 'animation',
       '-profile:v', 'high',
       '-movflags', 'faststart',
       '-pix_fmt', 'yuv420p',
@@ -547,6 +512,29 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
         '-maxrate', `${Math.round(options.videoBitrateKbps * 1.2)}k`,
         '-bufsize', `${options.videoBitrateKbps * 2}k`,
       );
+    }
+
+    args.push(outputPath);
+  } else if (targetFormat === 'webm') {
+    const crfMode = options.videoCrf !== undefined && options.videoCrf !== null && String(options.videoCrf) !== '';
+    const videoCrf = crfMode
+      ? toInt(options.videoCrf, 28, { min: 18, max: 40 })
+      : null;
+    args.push(
+      '-an',
+      '-c:v', 'libvpx-vp9',
+      '-row-mt', '1',
+      '-pix_fmt', 'yuv420p',
+      '-vf', `fps=${options.videoFps},scale=${options.outputWidth}:${options.outputHeight}:flags=lanczos`,
+    );
+
+    if (crfMode) {
+      args.push(
+        '-b:v', '0',
+        '-crf', String(videoCrf),
+      );
+    } else {
+      args.push('-b:v', `${options.videoBitrateKbps}k`);
     }
 
     args.push(outputPath);
@@ -580,31 +568,38 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
   return outputPath;
 }
 
-async function probeDurationSeconds(inputPath) {
-  if (!ffmpegPath) {
-    return null;
+async function renderScrollingVideo(page, options, tmpDir) {
+  const framesDir = path.join(tmpDir, 'frames');
+  const frameCount = Math.max(2, Math.round((options.totalDurationMs / 1000) * options.videoFps));
+  const easingFn = getEasingFunction(options.scrollEasing);
+
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
+  await page.waitForTimeout(120);
+
+  const { maxScroll } = await getScrollMetrics(page);
+  const segments = buildScrollTimeline(Math.max(0, maxScroll), options);
+
+  await mkdir(framesDir, { recursive: true });
+
+  for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+    const timeMs = Math.min(options.totalDurationMs, Math.round((frameIndex / options.videoFps) * 1000));
+    const scrollY = Math.round(positionForTimestamp(segments, timeMs, easingFn));
+    await page.evaluate((nextY) => window.scrollTo({ top: nextY, behavior: 'auto' }), scrollY);
+    await page.waitForTimeout(frameIndex === 0 ? 140 : 20);
+
+    await page.screenshot({
+      path: path.join(framesDir, `frame-${String(frameIndex).padStart(6, '0')}.png`),
+      type: 'png',
+      animations: 'disabled',
+    });
   }
 
-  return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, ['-i', inputPath], { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', reject);
-    child.on('close', () => {
-      const match = stderr.match(/Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)/);
-      if (!match) {
-        resolve(null);
-        return;
-      }
-
-      const [, hh, mm, ss] = match;
-      resolve((Number(hh) * 3600) + (Number(mm) * 60) + Number(ss));
-    });
-  });
+  return encodeFrames(
+    path.join(framesDir, 'frame-%06d.png'),
+    options.format,
+    tmpDir,
+    options,
+  );
 }
 
 async function capture(query) {
@@ -617,10 +612,6 @@ async function capture(query) {
       viewport: { width: options.viewportWidth, height: options.viewportHeight },
       deviceScaleFactor: options.deviceScaleFactor,
       ignoreHTTPSErrors: options.ignoreHostErrors,
-      recordVideo: options.scrollingRequested ? {
-        dir: tmpDir,
-        size: { width: options.outputWidth, height: options.outputHeight },
-      } : undefined,
     };
 
     const context = await browser.newContext(contextOptions);
@@ -654,35 +645,14 @@ async function capture(query) {
       };
     }
 
-    const video = page.video();
-    await recordScrollingVideo(page, options);
+    const outputPath = await renderScrollingVideo(page, options, tmpDir);
     await context.close();
-
-    const recordedPath = await video.path();
-    const recordedDurationSeconds = await probeDurationSeconds(recordedPath);
-    let outputPath = recordedPath;
-    let extension = 'webm';
-    let mimeType = VIDEO_MIME.webm;
-
-    if (options.format === 'mp4' || options.format === 'gif') {
-      const desiredDurationSeconds = options.totalDurationMs / 1000;
-      const trimStartSeconds = recordedDurationSeconds && recordedDurationSeconds > desiredDurationSeconds
-        ? Math.max(0, recordedDurationSeconds - desiredDurationSeconds)
-        : 0;
-      outputPath = await transcode(recordedPath, options.format, tmpDir, {
-        ...options,
-        trimStartSeconds,
-        trimDurationSeconds: desiredDurationSeconds,
-      });
-      extension = options.format;
-      mimeType = VIDEO_MIME[options.format];
-    }
 
     const buffer = await readFile(outputPath);
     return {
       buffer,
-      mimeType,
-      fileName: `${options.outputName}.${extension}`,
+      mimeType: VIDEO_MIME[options.format] || 'application/octet-stream',
+      fileName: `${options.outputName}.${options.format}`,
       cleanup: async () => {
         await browser.close();
         await rm(tmpDir, { recursive: true, force: true });
