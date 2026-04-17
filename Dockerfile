@@ -15,6 +15,7 @@ RUN apt-get update \
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
+RUN npx playwright install ffmpeg
 COPY server.js ./
 
 ENV PORT=3199
