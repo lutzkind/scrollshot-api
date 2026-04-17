@@ -2,6 +2,9 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates wget gnupg \
   && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux.gpg \
