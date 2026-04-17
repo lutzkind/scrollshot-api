@@ -108,7 +108,7 @@ function pickWaitUntilSequence(value) {
 }
 
 function normalizePreset(value) {
-  const preset = String(value || 'fast').trim().toLowerCase();
+  const preset = String(value || 'medium').trim().toLowerCase();
   if (['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'].includes(preset)) {
     return preset;
   }
@@ -116,7 +116,7 @@ function normalizePreset(value) {
 }
 
 function normalizeEasing(value) {
-  const easing = String(value || 'ease_in_out_quint').trim().toLowerCase();
+  const easing = String(value || 'ease_in_out_cubic').trim().toLowerCase();
   if (SUPPORTED_EASINGS.has(easing)) {
     return easing;
   }
@@ -220,9 +220,10 @@ function buildOptions(query) {
     scrollDelayMs: toInt(query.scroll_delay, 500, { min: 0, max: 15000 }),
     scrollStepDurationMs: toInt(query.scroll_duration, 1500, { min: 120, max: 30000 }),
     scrollByPx: toInt(query.scroll_by, Math.max(Math.round(viewportHeight * 0.92), 640), { min: 100, max: 3000 }),
+    scrollSteps: toInt(query.scroll_steps ?? query.scroll_count, scenario === 'scroll' ? 4 : 4, { min: 1, max: 12 }),
     scrollStartDelayMs: toInt(query.scroll_start_delay, 0, { min: 0, max: 30000 }),
     scrollStartImmediately: toBoolean(query.scroll_start_immediately, true),
-    scrollBack: toBoolean(query.scroll_back, scenario === 'scroll'),
+    scrollBack: toBoolean(query.scroll_back, false),
     scrollComplete: toBoolean(query.scroll_complete, true),
     scrollBackAfterDurationMs: query.scroll_back_after_duration === undefined
       ? null
@@ -301,9 +302,7 @@ async function preloadLazyContent(page) {
     lastScrollY = metrics.scrollY;
     await page.evaluate((nextY) => window.scrollTo({ top: nextY, behavior: 'auto' }), metrics.scrollY + viewportHeight);
     await page.waitForTimeout(250);
-    if (!options.scrollingRequested) {
-      await bestEffortNetworkIdle(page);
-    }
+    await bestEffortNetworkIdle(page);
   }
 
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
@@ -325,6 +324,7 @@ async function recordScrollingVideo(page, options) {
     scrollDelayMs,
     scrollStepDurationMs,
     scrollByPx,
+    scrollSteps,
     scrollBack,
     scrollComplete,
     scrollStartDelayMs,
@@ -357,6 +357,36 @@ async function recordScrollingVideo(page, options) {
       document.body.scrollHeight,
       document.documentElement.scrollHeight,
     ) - window.innerHeight;
+
+    const buildFractions = (count, targetCoverage) => {
+      const fractions = [];
+      const midpoint = (count - 1) / 2;
+
+      for (let index = 0; index < count; index += 1) {
+        const progress = (index + 1) / count;
+        const shaped = progress ** 0.92;
+        const symmetry = midpoint === 0 ? 0 : (index - midpoint) / midpoint;
+        const offset = symmetry * 0.012;
+        fractions.push(Math.min(targetCoverage, Math.max(0.08, shaped * targetCoverage + offset)));
+      }
+
+      return fractions;
+    };
+
+    const buildDurations = (count, budgetMs, pauseMs) => {
+      const weights = [1.05, 1.02, 0.98, 0.95, 0.92, 0.9, 0.88, 0.86];
+      const chosen = Array.from({ length: count }, (_, index) => weights[index] ?? 0.84);
+      const totalWeight = chosen.reduce((sum, entry) => sum + entry, 0);
+      const basePauses = count > 1
+        ? [0.9, 1.25, 0.78, 1.08, 0.88, 1.12, 0.82].slice(0, count - 1)
+        : [];
+      const pauseWeight = basePauses.reduce((sum, entry) => sum + entry, 0) || 1;
+
+      return {
+        scrolls: chosen.map((weight) => Math.round((budgetMs * weight) / totalWeight)),
+        pauses: basePauses.map((weight) => Math.round((pauseMs * weight) / pauseWeight)),
+      };
+    };
 
     const animateTo = async (destination, durationMs) => new Promise((resolve) => {
       const startY = window.scrollY;
@@ -393,64 +423,62 @@ async function recordScrollingVideo(page, options) {
       return { maxScroll: 0, reachedBottom: true };
     }
 
-    while (performance.now() < stopAt) {
+    const stepCount = Math.max(1, scrollSteps || 4);
+    const targetCoverage = scrollComplete ? 1 : Math.min(0.92, Math.max(0.74, (scrollByPx * stepCount) / Math.max(maxScroll, 1)));
+    const fractions = buildFractions(stepCount, targetCoverage);
+    const remainingBudgetMs = Math.max(0, stopAt - performance.now());
+    const reserveTailMs = Math.min(650, Math.round(remainingBudgetMs * 0.08));
+    const pauseBudgetMs = stepCount > 1
+      ? Math.min(
+          Math.max(0, remainingBudgetMs * 0.16),
+          Math.max(240, scrollDelayMs) * (stepCount - 1),
+        )
+      : 0;
+    const rawScrollBudgetMs = Math.max(
+      stepCount * 320,
+      remainingBudgetMs - reserveTailMs - pauseBudgetMs,
+    );
+    const budgets = buildDurations(stepCount, rawScrollBudgetMs, pauseBudgetMs);
+
+    for (let index = 0; index < stepCount && performance.now() < stopAt; index += 1) {
       const elapsed = performance.now() - startedAt;
-      const remaining = stopAt - performance.now();
-      const currentY = window.scrollY;
-      const atBottom = currentY >= maxScroll - 4;
 
       if (!scrolledBack && scrollBack && scrollBackAfterDurationMs !== null && elapsed >= scrollBackAfterDurationMs) {
-        await animateTo(0, Math.max(700, Math.round(scrollStepDurationMs * 0.85)));
+        await animateTo(0, Math.max(650, Math.round(scrollStepDurationMs * 0.75)));
         scrolledBack = true;
-        continue;
       }
 
-      if (atBottom) {
-        if (scrollComplete) {
-          break;
+      const currentY = window.scrollY;
+      const plannedTarget = Math.round(maxScroll * fractions[index]);
+      const minimumProgress = Math.round(currentY + Math.max(60, scrollByPx * 0.18));
+      const nextY = Math.max(currentY, Math.min(maxScroll, Math.max(plannedTarget, minimumProgress)));
+
+      if (nextY > currentY + 1) {
+        const remaining = stopAt - performance.now();
+        const durationMs = Math.max(
+          300,
+          Math.min(budgets.scrolls[index] ?? scrollStepDurationMs, remaining - 120),
+        );
+        await animateTo(nextY, durationMs);
+      }
+
+      if (index < stepCount - 1) {
+        const remaining = stopAt - performance.now();
+        const pauseMs = Math.max(0, Math.min(budgets.pauses[index] ?? scrollDelayMs, remaining - 60));
+        if (pauseMs > 0) {
+          await sleep(pauseMs);
         }
-
-        if (!scrolledBack && scrollBack && scrollBackAfterDurationMs === null && elapsed >= totalDurationMs * 0.72) {
-          await animateTo(0, Math.max(850, Math.round(scrollStepDurationMs * 0.95)));
-          scrolledBack = true;
-          continue;
-        }
-
-        await sleep(Math.min(remaining, 220));
-        continue;
       }
+    }
 
-      const plannedStep = scrollByPx + randInt(-scrollJitterPx, scrollJitterPx);
-      const correctionAllowance = Math.min(currentY, randInt(10, Math.max(18, Math.round(scrollJitterPx * 0.9))));
-      const nextY = Math.max(
-        0,
-        Math.min(maxScroll, currentY + plannedStep),
-      );
-      const stepDurationMs = Math.min(
-        Math.max(220, scrollStepDurationMs + randInt(-220, 260)),
-        Math.max(220, remaining - Math.min(scrollDelayMs, 180)),
-      );
+    if (!scrolledBack && scrollBack && scrollBackAfterDurationMs === null && scrollComplete && performance.now() < stopAt) {
+      await animateTo(0, Math.max(650, Math.round(scrollStepDurationMs * 0.72)));
+      scrolledBack = true;
+    }
 
-      await animateTo(nextY, stepDurationMs);
-
-      if (Math.random() < 0.38 && correctionAllowance > 14 && performance.now() + 180 < stopAt) {
-        const rewindTo = Math.max(0, window.scrollY - correctionAllowance);
-        window.scrollTo(0, rewindTo);
-        await sleep(randInt(80, 180));
-        window.scrollTo(0, Math.min(maxScroll, rewindTo + correctionAllowance + randInt(8, 24)));
-      }
-
-      if (performance.now() >= stopAt) {
-        break;
-      }
-
-      const pauseMs = Math.min(
-        Math.max(0, scrollDelayMs + randInt(-120, 160)),
-        Math.max(0, stopAt - performance.now()),
-      );
-      if (pauseMs > 0) {
-        await sleep(pauseMs);
-      }
+    const settleMs = Math.max(0, stopAt - performance.now());
+    if (settleMs > 0) {
+      await sleep(settleMs);
     }
 
     return {
@@ -462,6 +490,7 @@ async function recordScrollingVideo(page, options) {
     scrollDelayMs: options.scrollDelayMs,
     scrollStepDurationMs: options.scrollStepDurationMs,
     scrollByPx: options.scrollByPx,
+    scrollSteps: options.scrollSteps,
     scrollBack: options.scrollBack,
     scrollComplete: options.scrollComplete,
     scrollStartDelayMs: options.scrollStartDelayMs,
