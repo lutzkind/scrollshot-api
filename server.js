@@ -568,6 +568,53 @@ async function encodeFrames(inputPattern, targetFormat, tmpDir, options) {
   return outputPath;
 }
 
+async function syncMediaToTimeline(page, timeMs) {
+  const targetSeconds = Math.max(0, timeMs / 1000);
+  await page.evaluate(async ({ nextSeconds }) => {
+    const videos = Array.from(document.querySelectorAll('video'));
+    await Promise.allSettled(videos.map(async (video) => {
+      try {
+        video.pause();
+        video.muted = true;
+
+        const hasFiniteDuration = Number.isFinite(video.duration) && video.duration > 0;
+        if (!hasFiniteDuration) return;
+
+        const maxTime = Math.max(0, video.duration - (1 / 60));
+        const clampedSeconds = Math.min(nextSeconds, maxTime);
+        if (Math.abs(video.currentTime - clampedSeconds) < 0.03) return;
+
+        await new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            video.removeEventListener('seeked', finish);
+            video.removeEventListener('timeupdate', finish);
+            video.removeEventListener('loadeddata', finish);
+            video.removeEventListener('error', finish);
+            resolve();
+          };
+
+          video.addEventListener('seeked', finish, { once: true });
+          video.addEventListener('timeupdate', finish, { once: true });
+          video.addEventListener('loadeddata', finish, { once: true });
+          video.addEventListener('error', finish, { once: true });
+          window.setTimeout(finish, 600);
+
+          try {
+            video.currentTime = clampedSeconds;
+          } catch {
+            finish();
+          }
+        });
+      } catch {
+        // Ignore media elements that cannot be controlled cross-origin.
+      }
+    }));
+  }, { nextSeconds: targetSeconds });
+}
+
 async function renderScrollingVideo(page, options, tmpDir) {
   const framesDir = path.join(tmpDir, 'frames');
   const frameCount = Math.max(2, Math.round((options.totalDurationMs / 1000) * options.videoFps));
@@ -585,7 +632,8 @@ async function renderScrollingVideo(page, options, tmpDir) {
     const timeMs = Math.min(options.totalDurationMs, Math.round((frameIndex / options.videoFps) * 1000));
     const scrollY = Math.round(positionForTimestamp(segments, timeMs, easingFn));
     await page.evaluate((nextY) => window.scrollTo({ top: nextY, behavior: 'auto' }), scrollY);
-    await page.waitForTimeout(frameIndex === 0 ? 140 : 20);
+    await syncMediaToTimeline(page, timeMs);
+    await page.waitForTimeout(frameIndex === 0 ? 140 : 8);
 
     await page.screenshot({
       path: path.join(framesDir, `frame-${String(frameIndex).padStart(6, '0')}.png`),
