@@ -24,32 +24,26 @@ A small self-hosted replacement for ScreenshotOne built for n8n workflows.
 
 - `url` required
 - `format=png|jpeg|webp|webm|mp4|gif`
-- `scenario=scroll` for ScreenshotOne-style animated capture
-- `duration` total animation time in seconds, default `10`
 - `viewport_width` default `1280`
 - `viewport_height` default `720`
 - `device_scale_factor` default `1`
 - `full_page=true|false` default `true`
 - `full_page_scroll=true|false` to force scrolling video mode
 - `delay` wait in milliseconds after navigation
-- `wait_until=load|domcontentloaded|networkidle|commit` and repeated `wait_until` values are accepted
-- `scroll_delay` pause between scroll moves, default `500`
-- `scroll_duration` per-step motion duration, default `1500`
-- `scroll_by` step size in pixels, default roughly one viewport
-- `scroll_complete=true|false`
-- `scroll_start_delay` default `0`
-- `scroll_start_immediately=true|false`
+- `wait_until=load|domcontentloaded|networkidle|commit`
+- `scroll_duration` default `9000`
+- `hold_duration` default `1200`
 - `scroll_back=true|false`
-- `scroll_back_after_duration`
-- `scroll_stop_after_duration`
-- `scroll_easing`
-- `scroll_jitter_px`
-- `hold_duration`
 - `preload_lazy_content=true|false`
-- `video_bitrate_kbps` default `4000`
-- `video_preset` default `fast`
-- `video_crf` optional if you want CRF mode instead of target bitrate
-- `ignore_host_errors=true|false`
+- `scroll_pattern=preset_current|preset_random|manual` default `preset_current`
+- `scroll_start_immediately=true|false` manual mode only
+- `scroll_start_delay` manual mode only, default `2000`
+- `scroll_steps` manual mode only, default `4`
+- `scroll_complete=true|false` manual mode only, default `false`
+- `scroll_seed` optional seed for repeatable random preset captures
+- `scroll_pause_jitter` optional random preset tuning
+- `scroll_backtrack_px` optional random preset tuning
+- `scroll_burst_count` optional random preset tuning
 
 ## Local run
 
@@ -78,10 +72,10 @@ Example still image:
 http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=png&full_page=true&viewport_width=1280&viewport_height=2200&api_key=YOUR_KEY
 ```
 
-Example ScreenshotOne-style scrolling video for Cloudinary upload:
+Example scrolling video for Cloudinary upload:
 
 ```text
-http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&scenario=scroll&duration=10&scroll_complete=false&scroll_start_delay=2000&scroll_start_immediately=false&wait_until=domcontentloaded&wait_until=networkidle2&ignore_host_errors=true&api_key=YOUR_KEY
+http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=mp4&full_page_scroll=true&scroll_pattern=preset_random&viewport_width=1280&viewport_height=720&scroll_duration=9000&api_key=YOUR_KEY
 ```
 
 In n8n:
