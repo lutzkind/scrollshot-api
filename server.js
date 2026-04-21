@@ -179,6 +179,9 @@ function buildOptions(query) {
     randomPauseJitterMs: toInt(query.scroll_pause_jitter, 450, { min: 0, max: 5000 }),
     randomBacktrackPx: toInt(query.scroll_backtrack_px, 90, { min: 0, max: 600 }),
     randomBurstCount: toInt(query.scroll_burst_count, 0, { min: 0, max: 30 }),
+    videoFps: toInt(query.video_fps ?? query.fps, format === 'gif' ? 12 : 15, { min: 1, max: 60 }),
+    videoBitrateKbps: toInt(query.video_bitrate_kbps ?? query.bitrate_kbps, 1200, { min: 100, max: 20000 }),
+    videoPreset: String(query.video_preset || 'medium').trim().toLowerCase(),
     outputName: String(query.file_name || randomUUID()).replace(/[^a-zA-Z0-9._-]/g, '_'),
   };
 }
@@ -311,7 +314,7 @@ async function recordScrollingVideo(page, options) {
     };
 
     const runCurrentPattern = async () => {
-      await animateTo(0, maxScroll, durationMs);
+      await animateTo(0, finalTarget, durationMs);
     };
 
     const runManualPattern = async () => {
@@ -352,9 +355,9 @@ async function recordScrollingVideo(page, options) {
       for (let index = 0; index < bursts; index += 1) {
         cumulativeWeight += weights[index];
         const isLast = index === bursts - 1;
-        const target = isLast ? maxScroll : Math.min(
-          maxScroll,
-          maxScroll * (cumulativeWeight / totalWeight),
+        const target = isLast ? finalTarget : Math.min(
+          finalTarget,
+          finalTarget * (cumulativeWeight / totalWeight),
         );
         const moveDuration = Math.max(180, Math.round(forwardBudgetMs * (weights[index] / totalWeight)));
 
@@ -410,25 +413,35 @@ async function recordScrollingVideo(page, options) {
   }
 }
 
-async function transcode(inputPath, targetFormat, tmpDir) {
+async function transcode(inputPath, targetFormat, tmpDir, options) {
   if (!ffmpegPath) {
     throw new Error('ffmpeg-static is not available for transcoding');
   }
 
   const outputPath = path.join(tmpDir, `output.${targetFormat}`);
   const args = ['-y', '-i', inputPath];
+  const safePreset = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'].includes(options.videoPreset)
+    ? options.videoPreset
+    : 'medium';
+  const targetBitrate = `${options.videoBitrateKbps}k`;
+  const bufferBitrate = `${Math.max(options.videoBitrateKbps * 2, options.videoBitrateKbps + 500)}k`;
 
   if (targetFormat === 'mp4') {
     args.push(
       '-an',
+      '-c:v', 'libx264',
+      '-preset', safePreset,
+      '-b:v', targetBitrate,
+      '-maxrate', targetBitrate,
+      '-bufsize', bufferBitrate,
       '-movflags', 'faststart',
       '-pix_fmt', 'yuv420p',
-      '-vf', 'fps=30',
+      '-vf', `fps=${options.videoFps}`,
       outputPath,
     );
   } else if (targetFormat === 'gif') {
     args.push(
-      '-vf', 'fps=12,scale=1280:-1:flags=lanczos',
+      '-vf', `fps=${options.videoFps},scale=${options.width}:-1:flags=lanczos`,
       outputPath,
     );
   } else {
@@ -509,7 +522,7 @@ async function capture(query) {
     let mimeType = VIDEO_MIME.webm;
 
     if (options.format === 'mp4' || options.format === 'gif') {
-      outputPath = await transcode(recordedPath, options.format, tmpDir);
+      outputPath = await transcode(recordedPath, options.format, tmpDir, options);
       extension = options.format;
       mimeType = VIDEO_MIME[options.format];
     }
