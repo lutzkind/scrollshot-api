@@ -153,6 +153,9 @@ function buildOptions(query) {
     || toBoolean(query.animate, false)
     || toBoolean(query.scrolling_screenshot, false)
     || videoRequested;
+  const legacyDurationMs = query.duration == null
+    ? undefined
+    : Math.round((Number.parseFloat(String(query.duration)) || 0) * 1000);
 
   return {
     targetUrl: assertUrl(query.url),
@@ -168,7 +171,7 @@ function buildOptions(query) {
     imageQuality: toInt(query.image_quality ?? query.quality, 90, { min: 1, max: 100 }),
     scrollingRequested,
     scrollPattern: normalizeScrollPattern(query.scroll_pattern ?? query.scroll_profile),
-    scrollDurationMs: toInt(query.scroll_duration ?? query.animation_duration, 9000, { min: 1000, max: 120000 }),
+    scrollDurationMs: toInt(query.scroll_duration ?? query.animation_duration ?? legacyDurationMs, 9000, { min: 1000, max: 120000 }),
     holdDurationMs: toInt(query.hold_duration, 1200, { min: 0, max: 30000 }),
     scrollBack: toBoolean(query.scroll_back, false),
     scrollStartImmediately: toBoolean(query.scroll_start_immediately, false),
