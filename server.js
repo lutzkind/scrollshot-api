@@ -33,6 +33,7 @@ const VIDEO_MIME = {
   mp4: 'video/mp4',
   gif: 'image/gif',
 };
+const VIDEO_TRIM_PREROLL_MS = 300;
 
 function toBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -254,7 +255,7 @@ async function renderScreenshot(page, options) {
 }
 
 async function recordScrollingVideo(page, options) {
-  if (options.scrollPattern === 'manual' && !options.scrollStartImmediately && options.scrollStartDelayMs > 0) {
+  if (!options.scrollStartImmediately && options.scrollStartDelayMs > 0) {
     await page.waitForTimeout(options.scrollStartDelayMs);
   }
 
@@ -416,7 +417,7 @@ async function recordScrollingVideo(page, options) {
   }
 }
 
-async function transcode(inputPath, targetFormat, tmpDir, options) {
+async function finalizeVideo(inputPath, targetFormat, tmpDir, options, trimStartMs = 0) {
   if (!ffmpegPath) {
     throw new Error('ffmpeg-static is not available for transcoding');
   }
@@ -428,6 +429,11 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
     : 'medium';
   const targetBitrate = `${options.videoBitrateKbps}k`;
   const bufferBitrate = `${Math.max(options.videoBitrateKbps * 2, options.videoBitrateKbps + 500)}k`;
+  const trimStartSeconds = Math.max(0, trimStartMs) / 1000;
+
+  if (trimStartSeconds > 0) {
+    args.push('-ss', trimStartSeconds.toFixed(3));
+  }
 
   if (targetFormat === 'mp4') {
     args.push(
@@ -440,6 +446,13 @@ async function transcode(inputPath, targetFormat, tmpDir, options) {
       '-movflags', 'faststart',
       '-pix_fmt', 'yuv420p',
       '-vf', `fps=${options.videoFps}`,
+      outputPath,
+    );
+  } else if (targetFormat === 'webm') {
+    args.push(
+      '-an',
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
       outputPath,
     );
   } else if (targetFormat === 'gif') {
@@ -478,6 +491,7 @@ async function capture(query) {
   const browser = await launchBrowser();
 
   try {
+    const recordingStartedAt = Date.now();
     const contextOptions = {
       viewport: { width: options.width, height: options.height },
       deviceScaleFactor: options.deviceScaleFactor,
@@ -515,17 +529,28 @@ async function capture(query) {
       };
     }
 
+    const captureReadyAt = Date.now();
     const video = page.video();
     await recordScrollingVideo(page, options);
     await context.close();
 
     const recordedPath = await video.path();
+    const trimStartMs = Math.max(
+      0,
+      captureReadyAt - recordingStartedAt - VIDEO_TRIM_PREROLL_MS,
+    );
     let outputPath = recordedPath;
     let extension = 'webm';
     let mimeType = VIDEO_MIME.webm;
 
-    if (options.format === 'mp4' || options.format === 'gif') {
-      outputPath = await transcode(recordedPath, options.format, tmpDir, options);
+    if (trimStartMs > 0 || options.format === 'mp4' || options.format === 'gif') {
+      outputPath = await finalizeVideo(
+        recordedPath,
+        options.format,
+        tmpDir,
+        options,
+        trimStartMs,
+      );
       extension = options.format;
       mimeType = VIDEO_MIME[options.format];
     }
