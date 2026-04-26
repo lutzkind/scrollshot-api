@@ -20,6 +20,13 @@ A small self-hosted replacement for ScreenshotOne built for n8n workflows.
 - Default rate limit is `30` requests per `60` seconds per client IP
 - Tune with `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_MS`
 
+## Proxy configuration
+
+- Set `PROXY_URL` or `OUTBOUND_PROXY_URL` to route browser traffic through a default upstream proxy
+- Optional `PROXY_BYPASS` or `OUTBOUND_PROXY_BYPASS` sets Playwright's bypass list, for example `.internal,127.0.0.1`
+- Per-request overrides are available with `proxy_url` and `proxy_bypass`
+- Supported proxy schemes are `http`, `https`, and `socks5`
+
 ## Supported query params
 
 - `url` required
@@ -44,6 +51,8 @@ A small self-hosted replacement for ScreenshotOne built for n8n workflows.
 - `scroll_pause_jitter` optional random preset tuning
 - `scroll_backtrack_px` optional random preset tuning
 - `scroll_burst_count` optional random preset tuning
+- `proxy_url` optional upstream proxy URL, for example `http://user:pass@host:port`
+- `proxy_bypass` optional comma-separated bypass list passed to Playwright
 
 ## Local run
 
@@ -76,6 +85,12 @@ Example scrolling video for Cloudinary upload:
 
 ```text
 http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=mp4&full_page_scroll=true&scroll_pattern=preset_random&viewport_width=1280&viewport_height=720&scroll_duration=9000&api_key=YOUR_KEY
+```
+
+Example with a per-request proxy:
+
+```text
+http://127.0.0.1:3199/take?url=https%3A%2F%2Fexample.com&format=png&proxy_url=http%3A%2F%2Fuser%3Apass%40host%3A5055&api_key=YOUR_KEY
 ```
 
 In n8n:

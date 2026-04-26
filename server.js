@@ -11,6 +11,8 @@ const app = Fastify({ logger: true, trustProxy: true });
 const PORT = Number(process.env.PORT || 3199);
 const PLAYWRIGHT_CHANNEL = process.env.PLAYWRIGHT_CHANNEL || 'chrome';
 const CHROME_BIN = process.env.CHROME_BIN || '';
+const DEFAULT_PROXY_URL = process.env.PROXY_URL || process.env.OUTBOUND_PROXY_URL || '';
+const DEFAULT_PROXY_BYPASS = process.env.PROXY_BYPASS || process.env.OUTBOUND_PROXY_BYPASS || '';
 const API_KEYS = new Set(
   String(process.env.API_KEYS || process.env.API_KEY || '')
     .split(',')
@@ -147,6 +149,44 @@ function assertUrl(target) {
   return parsed.toString();
 }
 
+function normalizeProxyConfig(query) {
+  const rawProxyUrl = String(
+    query.proxy_url
+    ?? query.proxy
+    ?? DEFAULT_PROXY_URL,
+  ).trim();
+
+  if (!rawProxyUrl) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawProxyUrl);
+  } catch {
+    throw new Error('Invalid proxy URL');
+  }
+
+  if (!['http:', 'https:', 'socks5:'].includes(parsed.protocol)) {
+    throw new Error('Only http, https, and socks5 proxies are supported');
+  }
+
+  const server = `${parsed.protocol}//${parsed.host}`;
+  const username = decodeURIComponent(parsed.username || '');
+  const password = decodeURIComponent(parsed.password || '');
+  const bypass = String(
+    query.proxy_bypass
+    ?? DEFAULT_PROXY_BYPASS,
+  ).trim();
+
+  return {
+    server,
+    username: username || undefined,
+    password: password || undefined,
+    bypass: bypass || undefined,
+  };
+}
+
 function buildOptions(query) {
   const format = normalizeFormat(query.format);
   const videoRequested = ['webm', 'mp4', 'gif'].includes(format);
@@ -187,10 +227,11 @@ function buildOptions(query) {
     videoBitrateKbps: toInt(query.video_bitrate_kbps ?? query.bitrate_kbps, 1200, { min: 100, max: 20000 }),
     videoPreset: String(query.video_preset || 'medium').trim().toLowerCase(),
     outputName: String(query.file_name || randomUUID()).replace(/[^a-zA-Z0-9._-]/g, '_'),
+    proxy: normalizeProxyConfig(query),
   };
 }
 
-async function launchBrowser() {
+async function launchBrowser(options) {
   const launchOptions = {
     headless: true,
     args: [
@@ -200,6 +241,10 @@ async function launchBrowser() {
       '--hide-scrollbars',
     ],
   };
+
+  if (options?.proxy) {
+    launchOptions.proxy = options.proxy;
+  }
 
   if (CHROME_BIN) {
     launchOptions.executablePath = CHROME_BIN;
@@ -488,7 +533,7 @@ async function finalizeVideo(inputPath, targetFormat, tmpDir, options, trimStart
 async function capture(query) {
   const options = buildOptions(query);
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'scrollshot-'));
-  const browser = await launchBrowser();
+  const browser = await launchBrowser(options);
 
   try {
     const recordingStartedAt = Date.now();
